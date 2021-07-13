@@ -6,8 +6,14 @@
 #include <linux/in6.h>
 #include <stdbool.h>
 
-#define INGRESS_PROG_SEC "xdp"
-#define EGRESS_PROG_SEC "classifier"
+#define SEC_INGRESS_XDP "xdp"
+#define SEC_INGRESS_TC "classifier/ingress"
+#define SEC_EGRESS_TC "classifier/egress"
+
+typedef __u64 fixpoint64;
+#define FIXPOINT_SHIFT 16
+#define DOUBLE_TO_FIXPOINT(X) ((fixpoint64)((X) * (1UL << FIXPOINT_SHIFT)))
+#define FIXPOINT_TO_UINT(X) ((X) >> FIXPOINT_SHIFT)
 
 /* For the event_type members of rtt_event and flow_event */
 #define EVENT_TYPE_FLOW 1
@@ -16,7 +22,8 @@
 enum __attribute__((__packed__)) flow_event_type {
 	FLOW_EVENT_NONE,
 	FLOW_EVENT_OPENING,
-	FLOW_EVENT_CLOSING
+	FLOW_EVENT_CLOSING,
+	FLOW_EVENT_CLOSING_BOTH
 };
 
 enum __attribute__((__packed__)) flow_event_reason {
@@ -24,19 +31,22 @@ enum __attribute__((__packed__)) flow_event_reason {
 	EVENT_REASON_SYN_ACK,
 	EVENT_REASON_FIRST_OBS_PCKT,
 	EVENT_REASON_FIN,
-	EVENT_REASON_FIN_ACK,
 	EVENT_REASON_RST,
 	EVENT_REASON_FLOW_TIMEOUT
 };
 
 enum __attribute__((__packed__)) flow_event_source {
-	EVENT_SOURCE_EGRESS,
-	EVENT_SOURCE_INGRESS,
+	EVENT_SOURCE_PKT_SRC,
+	EVENT_SOURCE_PKT_DEST,
 	EVENT_SOURCE_USERSPACE
 };
 
 struct bpf_config {
 	__u64 rate_limit;
+	fixpoint64 rtt_rate;
+	bool use_srtt;
+	bool localfilt;
+	__u8 reserved[6];
 };
 
 /*
@@ -67,13 +77,16 @@ struct network_tuple {
 
 struct flow_state {
 	__u64 min_rtt;
+	__u64 srtt;
 	__u64 last_timestamp;
 	__u64 sent_pkts;
 	__u64 sent_bytes;
 	__u64 rec_pkts;
 	__u64 rec_bytes;
 	__u32 last_id;
-	__u32 reserved;
+	bool has_opened;
+	enum flow_event_reason opening_reason;
+	__u16 reserved;
 };
 
 struct packet_id {
@@ -100,13 +113,14 @@ struct rtt_event {
 	__u64 sent_bytes;
 	__u64 rec_pkts;
 	__u64 rec_bytes;
-	__u32 reserved;
+	bool match_on_egress;
+	__u8 reserved[7];
 };
 
-struct flow_event_info {
-	enum flow_event_type event;
-	enum flow_event_reason reason;
-};
+/* struct flow_event_info { */
+/* 	enum flow_event_type event; */
+/* 	enum flow_event_reason reason; */
+/* }; */
 
 /*
  * A flow event message that can be passed from the bpf-programs to user-space.
@@ -118,7 +132,8 @@ struct flow_event {
 	__u64 event_type;
 	__u64 timestamp;
 	struct network_tuple flow;
-	struct flow_event_info event_info;
+	enum flow_event_type flow_event_type;
+	enum flow_event_reason reason;
 	enum flow_event_source source;
 	__u8 reserved;
 };
@@ -128,5 +143,17 @@ union pping_event {
 	struct rtt_event rtt_event;
 	struct flow_event flow_event;
 };
+
+/*
+ * Copies the src to dest, but swapping place on saddr and daddr
+ */
+static void reverse_flow(struct network_tuple *dest, struct network_tuple *src)
+{
+	dest->ipv = src->ipv;
+	dest->proto = src->proto;
+	dest->saddr = src->daddr;
+	dest->daddr = src->saddr;
+	dest->reserved = 0;
+}
 
 #endif
